@@ -40,9 +40,10 @@ Open [http://localhost:3000](http://localhost:3000) and pick a version to start 
 
 Each major iteration of the editor lives at its own route:
 
-| Route | Description     |
-| ----- | --------------- |
-| `/v1` | Initial release |
+| Route | Description                                                   |
+| ----- | ------------------------------------------------------------- |
+| `/v2` | English UI, ring/shake, 3D transforms, skew, blur, color anim |
+| `/v1` | Initial release                                               |
 
 The landing page (`/`) links to all available versions.
 

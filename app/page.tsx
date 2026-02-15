@@ -2,11 +2,18 @@ import Link from "next/link";
 
 const VERSIONS = [
   {
+    version: "v2",
+    label: "v2.0.0",
+    description: "English UI, ring/shake effect, 3D transforms (perspective, rotateX/Y), skew, blur, stroke/fill color animation, and animation delay controls.",
+    date: "2026-02-15",
+    latest: true,
+  },
+  {
     version: "v1",
     label: "v1.0.0",
     description: "Initial release — SVG parsing, per-element animation controls, drag-to-move, frame settings, and motion/react code export.",
     date: "2026-02-15",
-    latest: true,
+    latest: false,
   },
 ];
 
