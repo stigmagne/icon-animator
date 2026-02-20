@@ -2,11 +2,18 @@ import Link from "next/link";
 
 const VERSIONS = [
   {
+    version: "v3",
+    label: "v3.0.0",
+    description: "Auto-play loop (▶ Play button), Select All/None elements, presets apply to all elements, auto-parse SVG on paste, Download .tsx, fully English UI, and refactored preview component.",
+    date: "2026-02-20",
+    latest: true,
+  },
+  {
     version: "v2",
     label: "v2.0.0",
     description: "English UI, ring/shake effect, 3D transforms (perspective, rotateX/Y), skew, blur, stroke/fill color animation, and animation delay controls.",
     date: "2026-02-15",
-    latest: true,
+    latest: false,
   },
   {
     version: "v1",
