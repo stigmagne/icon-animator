@@ -12,13 +12,16 @@ No design tool needed. No manual keyframe writing. Just paste → tweak → copy
 
 ## Features
 
-- Per-element animation controls (translate, rotate, scale, opacity)
-- Drag-to-move on the canvas
-- Wrap-around animation mode
+- Per-element animation controls (translate, rotate, scale, opacity, skew, blur, 3D, color)
+- Drag-to-move on the canvas (tracks any viewBox 1:1)
+- Wrap-around and ring/shake animation modes
 - Frame/border settings for the icon container
-- Animation presets (Bounce, Shake, Pulse, Fade In)
-- Scalable preview (24px–256px)
-- Clean `motion/react` code export with `forwardRef` and imperative API
+- Animation presets (Bounce, Shake, Pulse, Fade In, Ring, Draw, Blur In, Skew, 3D Flip, Gravity)
+- Scalable preview (24px–256px) with a Play/Stop toggle to preview without hovering
+- Undo / redo (with `Ctrl`/`Cmd`+`Z` and `Shift`+`Ctrl`/`Cmd`+`Z`)
+- Auto-saves your work to `localStorage` — refresh without losing progress
+- Save / load projects as `.iconproj.json` files
+- Clean `motion/react` code export with `forwardRef` and imperative API — copy or download as `.tsx`
 
 ## Getting Started
 

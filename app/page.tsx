@@ -4,7 +4,7 @@ const VERSIONS = [
   {
     version: "v2",
     label: "v2.0.0",
-    description: "English UI, ring/shake effect, 3D transforms (perspective, rotateX/Y), skew, blur, stroke/fill color animation, and animation delay controls.",
+    description: "English UI, ring/shake effect, 3D transforms (perspective, rotateX/Y), skew, blur, stroke/fill color animation, animation delay controls, undo/redo, localStorage autosave, project save/load, and .tsx download.",
     date: "2026-02-15",
     latest: true,
   },
