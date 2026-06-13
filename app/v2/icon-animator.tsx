@@ -58,6 +58,14 @@ type LoopMode = "once" | "loop" | "ping-pong";
 type TriggerMode = "hover" | "auto";
 type Animations = Record<string, AnimationState>;
 
+// A snapshot of the editable state, used for undo/redo and persistence.
+interface Snapshot {
+  animations: Animations;
+  frameSettings: FrameSettings;
+}
+
+const STORAGE_KEY = "icon-animator-v2";
+
 // ============================================================
 // Icon Animator – a visual tool for creating animated SVG icons
 // Inspired by itshover.com (https://github.com/itshover/itshover)
@@ -381,8 +389,12 @@ function generateExportCode(parsed: ParsedSVG | null, animations: Animations, na
       // Add initial state props for animated elements
       const initProps: string[] = [];
       if (a?.strokeDraw > 0) initProps.push(`pathLength={0}`);
-      if (a?.blur > 0) initProps.push(`style={{ filter: "blur(${a.blur}px)" }}`);
-      if (a?.perspective > 0) initProps.push(`style={{ perspective: ${a.perspective} }}`);
+      // Merge all inline-style entries into a single style prop so we never emit
+      // two `style={{...}}` attributes on the same element (invalid JSX).
+      const styleEntries: string[] = [];
+      if (a?.blur > 0) styleEntries.push(`filter: "blur(${a.blur}px)"`);
+      if (a?.perspective > 0) styleEntries.push(`perspective: ${a.perspective}`);
+      if (styleEntries.length > 0) initProps.push(`style={{ ${styleEntries.join(", ")} }}`);
       const extra = initProps.length > 0 ? " " + initProps.join(" ") : "";
       return `        <motion.${el.tag} className="${el.id}" ${attrPairs}${extra} />`;
     })
@@ -400,20 +412,15 @@ function generateExportCode(parsed: ParsedSVG | null, animations: Animations, na
     startBody += wrapStartLines.join("\n") + "\n";
   }
 
-  // Build the end handler body
-  let endBody = "      await Promise.all([\n";
-  endBody += [...endCalls, ...ringEndLines, ...wrapEndLines].join(",\n");
-  endBody += "\n      ]);\n";
+  // Build the end handler body (only emit Promise.all when there is something to reset)
+  let endBody = "";
+  const allEndCalls = [...endCalls, ...ringEndLines, ...wrapEndLines];
+  if (allEndCalls.length > 0) {
+    endBody += `      await Promise.all([\n${allEndCalls.join(",\n")}\n      ]);\n`;
+  }
 
   // Frame wrapper
   const hasFrame = frame.enabled;
-  const frameStyleParts: string[] = [];
-  if (hasFrame) {
-    frameStyleParts.push(`borderRadius: ${frame.borderRadius}`);
-    frameStyleParts.push(`border: \`\${${frame.borderWidth}}px solid ${frame.borderColor}\``);
-    if (frame.bgColor !== "transparent") frameStyleParts.push(`backgroundColor: "${frame.bgColor}"`);
-    frameStyleParts.push(`padding: ${frame.padding}`);
-  }
 
   const wrapperStyle = hasFrame
     ? `{ width: size + ${frame.padding * 2 + frame.borderWidth * 2}, height: size + ${frame.padding * 2 + frame.borderWidth * 2}, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: ${frame.borderRadius}, border: "${frame.borderWidth}px solid ${frame.borderColor}"${frame.bgColor !== "transparent" ? `, backgroundColor: "${frame.bgColor}"` : ""}, padding: ${frame.padding}, overflow: "hidden" }`
@@ -513,6 +520,7 @@ export default function IconAnimatorPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [animations, setAnimations] = useState<Animations>({});
   const [isHovering, setIsHovering] = useState(false);
+  const [pinned, setPinned] = useState(false); // keep the preview animating without hovering
   const [showCode, setShowCode] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
   const [componentName, setComponentName] = useState("MyIcon");
@@ -522,7 +530,120 @@ export default function IconAnimatorPage() {
   const [frameSettings, setFrameSettings] = useState<FrameSettings>({ ...DEFAULT_FRAME });
 
   const canvasRef = useRef<HTMLDivElement>(null);
-  const dragState = useRef<{ active: boolean; startX?: number; startY?: number; elId?: string; pxPerUnit?: number; origTx?: number; origTy?: number }>({ active: false });
+  const dragState = useRef<{ active: boolean; pushed?: boolean; startX?: number; startY?: number; elId?: string; pxPerUnit?: number; origTx?: number; origTy?: number }>({ active: false });
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ---- Undo / redo history ----
+  // Refs mirror the current editable state so snapshots can be taken without
+  // depending on stale closures.
+  const animationsRef = useRef(animations);
+  const frameRef = useRef(frameSettings);
+  useEffect(() => { animationsRef.current = animations; }, [animations]);
+  useEffect(() => { frameRef.current = frameSettings; }, [frameSettings]);
+
+  const historyRef = useRef<{ past: Snapshot[]; future: Snapshot[] }>({ past: [], future: [] });
+  const lastPushRef = useRef(0);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
+  const syncHistoryFlags = useCallback(() => {
+    setCanUndo(historyRef.current.past.length > 0);
+    setCanRedo(historyRef.current.future.length > 0);
+  }, []);
+
+  // Snapshot the state *before* a mutation. Rapid edits (e.g. dragging a slider)
+  // are coalesced into one entry within a 500ms window unless `force` is set.
+  const pushHistory = useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastPushRef.current < 500) return;
+    lastPushRef.current = now;
+    const h = historyRef.current;
+    h.past.push({ animations: animationsRef.current, frameSettings: frameRef.current });
+    if (h.past.length > 50) h.past.shift();
+    h.future = [];
+    syncHistoryFlags();
+  }, [syncHistoryFlags]);
+
+  const undo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.past.length === 0) return;
+    const prev = h.past.pop()!;
+    h.future.unshift({ animations: animationsRef.current, frameSettings: frameRef.current });
+    setAnimations(prev.animations);
+    setFrameSettings(prev.frameSettings);
+    syncHistoryFlags();
+  }, [syncHistoryFlags]);
+
+  const redo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.future.length === 0) return;
+    const next = h.future.shift()!;
+    h.past.push({ animations: animationsRef.current, frameSettings: frameRef.current });
+    setAnimations(next.animations);
+    setFrameSettings(next.frameSettings);
+    syncHistoryFlags();
+  }, [syncHistoryFlags]);
+
+  // Keyboard shortcuts: Cmd/Ctrl+Z = undo, Shift+Cmd/Ctrl+Z = redo
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.key.toLowerCase() !== "z") return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+      e.preventDefault();
+      if (e.shiftKey) redo();
+      else undo();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo, redo]);
+
+  // ---- localStorage persistence ----
+  // Hydrate once on mount. This must run in an effect (not a lazy initializer)
+  // so the server-rendered markup matches the first client render, then we
+  // apply any saved work. The synchronous setState here is intentional.
+  const hydratedRef = useRef(false);
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (typeof data.svgInput === "string" && data.svgInput.trim()) {
+          const result = parseSVG(data.svgInput);
+          if (result && result.elements.length > 0) {
+            setSvgInput(data.svgInput);
+            setParsed(result);
+            const anims: Animations = {};
+            result.elements.forEach((el) => {
+              anims[el.id] = { ...EMPTY_ANIM, ...(data.animations?.[el.id] || {}) };
+            });
+            setAnimations(anims);
+            if (data.frameSettings) setFrameSettings({ ...DEFAULT_FRAME, ...data.frameSettings });
+            if (typeof data.componentName === "string") setComponentName(data.componentName);
+            if (typeof data.previewScale === "number") setPreviewScale(data.previewScale);
+          }
+        }
+      }
+    } catch {
+      // Ignore corrupt/unavailable storage.
+    }
+    hydratedRef.current = true;
+  }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    try {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ svgInput, animations, frameSettings, componentName, previewScale })
+      );
+    } catch {
+      // Ignore quota/unavailable storage.
+    }
+  }, [svgInput, animations, frameSettings, componentName, previewScale]);
 
   // Load and parse an SVG string
   const loadSVG = useCallback((svg: string) => {
@@ -547,6 +668,7 @@ export default function IconAnimatorPage() {
 
   // Update animation property for all selected elements
   const updateAnim = useCallback((_id: string, key: string, val: number | string | boolean) => {
+    pushHistory();
     setSelectedIds((sel) => {
       setAnimations((prev) => {
         const next = { ...prev };
@@ -557,10 +679,11 @@ export default function IconAnimatorPage() {
       });
       return sel;
     });
-  }, []);
+  }, [pushHistory]);
 
   // Reset animation for all selected elements
   const resetAnim = useCallback((_id: string) => {
+    pushHistory(true);
     setSelectedIds((sel) => {
       setAnimations((prev) => {
         const next = { ...prev };
@@ -571,17 +694,24 @@ export default function IconAnimatorPage() {
       });
       return sel;
     });
-  }, []);
+  }, [pushHistory]);
 
   // Reset all animations
   const resetAll = useCallback(() => {
     if (!parsed) return;
+    pushHistory(true);
     const anims: Animations = {};
     parsed.elements.forEach((el) => {
       anims[el.id] = { ...EMPTY_ANIM };
     });
     setAnimations(anims);
-  }, [parsed]);
+  }, [parsed, pushHistory]);
+
+  // Update frame settings with an undo snapshot
+  const updateFrame = useCallback((updater: (prev: FrameSettings) => FrameSettings) => {
+    pushHistory();
+    setFrameSettings(updater);
+  }, [pushHistory]);
 
   // First selected ID drives the controls display
   const selectedId = selectedIds.size > 0 ? Array.from(selectedIds)[0] : null;
@@ -607,12 +737,15 @@ export default function IconAnimatorPage() {
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
-      // Map pixel movement to SVG coordinate space
-      const svgSize = 24;
+      // Map pixel movement to SVG coordinate space using the real viewBox width
+      // (viewBox = "minX minY width height"), so dragging tracks the cursor 1:1
+      // regardless of the icon's coordinate system.
+      const svgSize = parsed ? Number(parsed.viewBox.split(/\s+/)[2]) || 24 : 24;
       const pxPerUnit = rect.width / svgSize;
 
       dragState.current = {
         active: true,
+        pushed: false,
         startX: e.clientX,
         startY: e.clientY,
         elId,
@@ -621,7 +754,7 @@ export default function IconAnimatorPage() {
         origTy: animations[elId]?.translateY || 0,
       };
     },
-    [animations]
+    [animations, parsed]
   );
 
   useEffect(() => {
@@ -632,7 +765,12 @@ export default function IconAnimatorPage() {
       const dy = (e.clientY - (d.startY || 0)) / (d.pxPerUnit || 1);
       const tx = Math.round(((d.origTx || 0) + dx) * 2) / 2; // snap to 0.5
       const ty = Math.round(((d.origTy || 0) + dy) * 2) / 2;
-      if (d.elId) {
+      if (d.elId && (tx !== (d.origTx || 0) || ty !== (d.origTy || 0))) {
+        // Record one undo entry per drag gesture, on the first real movement.
+        if (!d.pushed) {
+          pushHistory(true);
+          d.pushed = true;
+        }
         setAnimations((prev) => ({
           ...prev,
           [d.elId!]: { ...prev[d.elId!], translateX: tx, translateY: ty },
@@ -648,7 +786,7 @@ export default function IconAnimatorPage() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, []);
+  }, [pushHistory]);
 
   // Ring effect: Web Animations API approach — bypasses CSP entirely
   const svgElRefs = useRef<Map<string, SVGElement | null>>(new Map());
@@ -764,6 +902,65 @@ export default function IconAnimatorPage() {
     });
   }
 
+  // Trigger a browser download of in-memory content.
+  function downloadFile(filename: string, content: string, type: string) {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  const safeName = componentName || "MyIcon";
+
+  function handleDownloadCode() {
+    downloadFile(`${safeName}.tsx`, exportCode, "text/plain;charset=utf-8");
+  }
+
+  function handleSaveProject() {
+    const project = JSON.stringify(
+      { svgInput, animations, frameSettings, componentName: safeName },
+      null,
+      2
+    );
+    downloadFile(`${safeName}.iconproj.json`, project, "application/json");
+  }
+
+  function handleLoadProject(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(String(reader.result));
+        if (typeof data.svgInput !== "string") return;
+        const result = parseSVG(data.svgInput);
+        if (!result || result.elements.length === 0) return;
+        pushHistory(true);
+        setSvgInput(data.svgInput);
+        setParsed(result);
+        setParseError(false);
+        setSelectedIds(new Set());
+        setShowCode(false);
+        const anims: Animations = {};
+        result.elements.forEach((el) => {
+          anims[el.id] = { ...EMPTY_ANIM, ...(data.animations?.[el.id] || {}) };
+        });
+        setAnimations(anims);
+        setFrameSettings({ ...DEFAULT_FRAME, ...(data.frameSettings || {}) });
+        if (typeof data.componentName === "string") setComponentName(data.componentName);
+      } catch {
+        // Ignore invalid project files.
+      }
+    };
+    reader.readAsText(file);
+  }
+
   const anyAnimated =
     parsed &&
     parsed.elements.some((el) => hasAnimation(animations[el.id]));
@@ -783,6 +980,25 @@ export default function IconAnimatorPage() {
         </div>
 
         <div className="flex gap-2">
+          {/* Undo / Redo */}
+          <div className="flex gap-1">
+            <button
+              onClick={undo}
+              disabled={!canUndo}
+              title="Undo (Ctrl/Cmd+Z)"
+              className="px-2.5 py-1.5 rounded-md text-xs font-medium bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              ↶
+            </button>
+            <button
+              onClick={redo}
+              disabled={!canRedo}
+              title="Redo (Shift+Ctrl/Cmd+Z)"
+              className="px-2.5 py-1.5 rounded-md text-xs font-medium bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              ↷
+            </button>
+          </div>
           <button
             onClick={() => setShowPaste(!showPaste)}
             className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${showPaste
@@ -792,8 +1008,30 @@ export default function IconAnimatorPage() {
           >
             Paste SVG
           </button>
+          {/* Load project (always available) */}
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            title="Load a saved .iconproj.json project"
+            className="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 transition-colors"
+          >
+            Load
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,application/json"
+            onChange={handleLoadProject}
+            className="hidden"
+          />
           {parsed && (
             <>
+              <button
+                onClick={handleSaveProject}
+                title="Save your work as a .iconproj.json file"
+                className="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 transition-colors"
+              >
+                Save
+              </button>
               <button
                 onClick={resetAll}
                 className="px-3 py-1.5 rounded-md text-xs font-medium bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 transition-colors"
@@ -950,11 +1188,28 @@ export default function IconAnimatorPage() {
                   : "Hover = preview · Click = select · Drag = move"}
               </p>
 
+              {/* Play / Stop toggle — animate without hovering */}
+              <button
+                onClick={() =>
+                  setPinned((p) => {
+                    const next = !p;
+                    setIsHovering(next);
+                    return next;
+                  })
+                }
+                className={`mb-3 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${pinned
+                  ? "bg-violet-600 text-white"
+                  : "bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200"
+                  }`}
+              >
+                {pinned ? "⏸ Stop" : "▶ Play"}
+              </button>
+
               {/* Preview box */}
               <div
                 ref={canvasRef}
                 onMouseEnter={() => setIsHovering(true)}
-                onMouseLeave={() => setIsHovering(false)}
+                onMouseLeave={() => { if (!pinned) setIsHovering(false); }}
                 style={{
                   width: 200,
                   height: 200,
@@ -1005,7 +1260,7 @@ export default function IconAnimatorPage() {
                 <span className="text-[9px] text-gray-400 dark:text-gray-600 uppercase">24px:</span>
                 <div
                   onMouseEnter={() => setIsHovering(true)}
-                  onMouseLeave={() => setIsHovering(false)}
+                  onMouseLeave={() => { if (!pinned) setIsHovering(false); }}
                   className="cursor-pointer p-2 rounded-lg bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700"
                 >
                   <svg
@@ -1036,7 +1291,7 @@ export default function IconAnimatorPage() {
                 <span className="text-[9px] text-gray-400 dark:text-gray-600 uppercase">48px:</span>
                 <div
                   onMouseEnter={() => setIsHovering(true)}
-                  onMouseLeave={() => setIsHovering(false)}
+                  onMouseLeave={() => { if (!pinned) setIsHovering(false); }}
                   className="cursor-pointer p-2 rounded-lg bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700"
                 >
                   <svg
@@ -1112,6 +1367,7 @@ export default function IconAnimatorPage() {
                     <button
                       key={name}
                       onClick={() => {
+                        pushHistory(true);
                         setAnimations((prev) => ({
                           ...prev,
                           [selectedId]: { ...prev[selectedId], ...preset },
@@ -1293,7 +1549,7 @@ export default function IconAnimatorPage() {
                 {selectedAnim.ringEffect && (
                   <>
                     <Slider
-                      label="Vinkel"
+                      label="Angle"
                       value={selectedAnim.ringAngle}
                       onChange={(v) => updateAnim(selectedId, "ringAngle", v)}
                       min={5}
@@ -1302,7 +1558,7 @@ export default function IconAnimatorPage() {
                       unit="°"
                     />
                     <Slider
-                      label="Antall"
+                      label="Count"
                       value={selectedAnim.ringCount}
                       onChange={(v) => updateAnim(selectedId, "ringCount", v)}
                       min={2}
@@ -1314,7 +1570,7 @@ export default function IconAnimatorPage() {
 
                 {/* 3D Perspective */}
                 <p className="text-[9px] text-gray-400 dark:text-gray-600 uppercase tracking-widest mb-2 mt-3">
-                  3D Perspektiv
+                  3D Perspective
                 </p>
                 <Slider
                   label="Rotate X"
@@ -1335,7 +1591,7 @@ export default function IconAnimatorPage() {
                   unit="°"
                 />
                 <Slider
-                  label="Perspektiv"
+                  label="Perspective"
                   value={selectedAnim.perspective}
                   onChange={(v) => updateAnim(selectedId, "perspective", v)}
                   min={0}
@@ -1349,7 +1605,7 @@ export default function IconAnimatorPage() {
                   Timing
                 </p>
                 <Slider
-                  label="Varighet"
+                  label="Duration"
                   value={selectedAnim.duration}
                   onChange={(v) => updateAnim(selectedId, "duration", v)}
                   min={0.1}
@@ -1358,7 +1614,7 @@ export default function IconAnimatorPage() {
                   unit="s"
                 />
                 <Slider
-                  label="Forsinkelse"
+                  label="Delay"
                   value={selectedAnim.delay}
                   onChange={(v) => updateAnim(selectedId, "delay", v)}
                   min={0}
@@ -1405,7 +1661,7 @@ export default function IconAnimatorPage() {
                 </span>
                 <button
                   onClick={() =>
-                    setFrameSettings((prev) => ({
+                    updateFrame((prev) => ({
                       ...prev,
                       enabled: !prev.enabled,
                     }))
@@ -1425,7 +1681,7 @@ export default function IconAnimatorPage() {
                     label="Border Radius"
                     value={frameSettings.borderRadius}
                     onChange={(v) =>
-                      setFrameSettings((prev) => ({
+                      updateFrame((prev) => ({
                         ...prev,
                         borderRadius: v,
                       }))
@@ -1439,7 +1695,7 @@ export default function IconAnimatorPage() {
                     label="Border Width"
                     value={frameSettings.borderWidth}
                     onChange={(v) =>
-                      setFrameSettings((prev) => ({
+                      updateFrame((prev) => ({
                         ...prev,
                         borderWidth: v,
                       }))
@@ -1453,7 +1709,7 @@ export default function IconAnimatorPage() {
                     label="Padding"
                     value={frameSettings.padding}
                     onChange={(v) =>
-                      setFrameSettings((prev) => ({ ...prev, padding: v }))
+                      updateFrame((prev) => ({ ...prev, padding: v }))
                     }
                     min={0}
                     max={24}
@@ -1471,7 +1727,7 @@ export default function IconAnimatorPage() {
                         type="color"
                         value={frameSettings.borderColor}
                         onChange={(e) =>
-                          setFrameSettings((prev) => ({
+                          updateFrame((prev) => ({
                             ...prev,
                             borderColor: e.target.value,
                           }))
@@ -1498,7 +1754,7 @@ export default function IconAnimatorPage() {
                             : frameSettings.bgColor
                         }
                         onChange={(e) =>
-                          setFrameSettings((prev) => ({
+                          updateFrame((prev) => ({
                             ...prev,
                             bgColor: e.target.value,
                           }))
@@ -1511,7 +1767,7 @@ export default function IconAnimatorPage() {
                       {frameSettings.bgColor !== "transparent" && (
                         <button
                           onClick={() =>
-                            setFrameSettings((prev) => ({
+                            updateFrame((prev) => ({
                               ...prev,
                               bgColor: "transparent",
                             }))
@@ -1550,15 +1806,23 @@ export default function IconAnimatorPage() {
               />
               <span className="text-[10px] text-gray-400 dark:text-gray-600">.tsx</span>
             </div>
-            <button
-              onClick={handleCopy}
-              className={`px-4 py-1 rounded-md text-xs font-semibold transition-colors ${copied
-                ? "bg-emerald-600 text-white"
-                : "bg-violet-600 text-white hover:bg-violet-500"
-                }`}
-            >
-              {copied ? "✓ Copied!" : "Copy Code"}
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={handleDownloadCode}
+                className="px-4 py-1 rounded-md text-xs font-semibold bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors"
+              >
+                Download .tsx
+              </button>
+              <button
+                onClick={handleCopy}
+                className={`px-4 py-1 rounded-md text-xs font-semibold transition-colors ${copied
+                  ? "bg-emerald-600 text-white"
+                  : "bg-violet-600 text-white hover:bg-violet-500"
+                  }`}
+              >
+                {copied ? "✓ Copied!" : "Copy Code"}
+              </button>
+            </div>
           </div>
           <pre className="flex-1 overflow-auto p-4 text-[10px] leading-relaxed font-mono text-violet-300/80">
             {exportCode}
